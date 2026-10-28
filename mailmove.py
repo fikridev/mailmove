@@ -1,42 +1,26 @@
-#!/usr/bin/env python3
 """
-mailmove.py : copy all mail from one IMAP server to another (any hosting).
+mailmove.py : IMAP primitives for MailMove v2.
 
-Usage:
-  python mailmove.py --src-host mail.oldhost.com --dst-host mail.newhost.com --accounts accounts.csv
-  python mailmove.py ... --dry-run            # count only, copy nothing
-  python mailmove.py ... --workers 4          # migrate 4 mailboxes in parallel
-  python mailmove.py ... --skip trash,junk    # skip folders by name or role
-  python mailmove.py ... --big-mb 25          # flag emails over 25 MB (default)
+Used by worker.py (the migration engine) and app.py (connection test). This
+module never writes to the source: folders are opened with EXAMINE, bodies are
+read with BODY.PEEK[], and no STORE / EXPUNGE / COPY / MOVE / DELETE is issued.
 
-The dry run also reports total size, attachment count, large emails and a
-rough copy-time estimate.
-
-accounts.csv columns (header required):
-  src_user,src_pass,dst_user,dst_pass
-  (dst_user / dst_pass may be blank to reuse the source values)
-
-Safe to re-run: messages already on the destination are skipped, so run it
-once before switching MX, then again after (delta sync).
-Source mailbox is opened read-only and messages are fetched with PEEK, so
-read/unread status on the old server is untouched.
-
-Requires Python 3.9+. Standard library only.
+Connections are IMAPS on port 993 only (ssl.create_default_context): the
+certificate chain, expiry and hostname are always verified, for both source and
+destination. There is no STARTTLS and no plaintext fallback.
 """
-import argparse
-import csv
-import email
-import email.policy
 import imaplib
-import logging
 import re
 import socket
-import sys
+import ssl
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
+from collections import defaultdict
+
+import config
 
 imaplib._MAXLINE = 50_000_000  # big mailboxes return long FETCH lines
+
+MB = 1024 * 1024
 
 ROLE_NAMES = {
     "\\sent": {"sent", "sent items", "sent messages", "sent mail"},
@@ -48,12 +32,15 @@ ROLE_NAMES = {
 
 LIST_RE = re.compile(rb'\((?P<flags>[^)]*)\) (?P<delim>"(?:\\.|[^"])*"|NIL) (?P<name>.+)$')
 TOKEN_RE = re.compile(rb'\s*(?:(\()|(\))|"((?:\\.|[^"\\])*)"|\{(\d+)\}\r\n|([^\s()"]+))')
-MB = 1024 * 1024
+APPENDUID_RE = re.compile(rb"\[APPENDUID (\d+) (\d+)\]", re.I)
+MESSAGE_ID_RE = re.compile(rb"^Message-ID:\s*(<[^>\r\n]+>|\S+)", re.I | re.M)
+META_ITEMS = "(UID RFC822.SIZE INTERNALDATE FLAGS BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])"
 
 
-# ---------------------------------------------------------------- helpers
+# ---------------------------------------------------------------- formatting / estimates
 
 def fmt_size(n):
+    n = n or 0
     return f"{n / 1024 ** 3:.2f} GB" if n >= 1024 ** 3 else f"{n / MB:.1f} MB"
 
 
@@ -66,17 +53,16 @@ def fmt_duration(sec):
 
 
 def estimate_seconds(accounts, workers):
-    """Rough (fast, slow) copy time for [{"bytes": n, "count": n}, ...].
-
-    Each message costs a round trip on top of its transfer time, and accounts
-    run `workers` at a time, so the biggest account sets the minimum.
-    """
+    """Rough (fast, slow) copy time for [{"bytes": n, "count": n}, ...]. An ESTIMATE:
+    assumes 1-4 MB/s plus a round trip per message; accounts run `workers` at a time."""
     out = []
     for mbps, per_msg in ((4, 0.05), (1, 0.25)):
         times = [a["bytes"] / (mbps * MB) + a["count"] * per_msg for a in accounts]
         out.append(max(max(times, default=0), sum(times) / max(workers, 1)))
     return tuple(out)
 
+
+# ---------------------------------------------------------------- IMAP parsing helpers
 
 def uid_sets(uids, chunk=500):
     """Yield compact UID sets ("1:5,9,12:14") of up to `chunk` UIDs each."""
@@ -165,11 +151,15 @@ def unquote(raw: bytes) -> str:
 def parse_fetch(data):
     """Turn imaplib FETCH output into [(meta_bytes, literal_bytes), ...]."""
     out, cur = [], None
-    for part in data:
+    for part in data or []:
         if isinstance(part, tuple):
             if cur:
                 out.append(cur)
             cur = [part[0], part[1]]
+        elif isinstance(part, bytes) and re.match(rb"\d+ \(", part):
+            if cur:  # a response without any literal (e.g. empty header sent as "")
+                out.append(cur)
+            cur = [part, b""]
         elif isinstance(part, bytes) and cur is not None:
             cur[0] += b" " + part  # trailing fields, e.g. " UID 12)"
     if cur:
@@ -177,16 +167,34 @@ def parse_fetch(data):
     return out
 
 
-def message_key(header: bytes, size: int, idate: bytes) -> str:
-    m = re.search(rb"Message-ID:\s*(<[^>]+>|\S+)", header or b"", re.I)
-    if m:
-        return m.group(1).decode("utf-8", "replace").strip().lower()
+def internal_epoch(idate):
+    """INTERNALDATE string -> epoch seconds (None if unparseable)."""
+    if not idate:
+        return None
     try:
-        t = imaplib.Internaldate2tuple(b'INTERNALDATE "' + idate + b'"')
-        stamp = str(int(time.mktime(t)))
+        t = imaplib.Internaldate2tuple(b'INTERNALDATE "' + idate.encode() + b'"')
+        return int(time.mktime(t)) if t else None
     except Exception:
-        stamp = idate.decode(errors="replace")
-    return f"nomid|{size}|{stamp}"
+        return None
+
+
+def parse_meta(meta, literal):
+    uid = re.search(rb"UID (\d+)", meta)
+    if not uid:
+        return None
+    size = re.search(rb"RFC822\.SIZE (\d+)", meta)
+    idate = re.search(rb'INTERNALDATE "([^"]+)"', meta)
+    flags = re.search(rb"FLAGS \(([^)]*)\)", meta)
+    mid = MESSAGE_ID_RE.search(literal or b"")
+    idate_s = idate.group(1).decode() if idate else None
+    return {
+        "uid": int(uid.group(1)),
+        "size": int(size.group(1)) if size else 0,
+        "idate": idate_s,
+        "epoch": internal_epoch(idate_s),
+        "mid": mid.group(1).decode("utf-8", "replace").strip() if mid else None,
+        "flags": flags.group(1).decode() if flags else "",
+    }
 
 
 def folder_role(name, flags, delim, prefix):
@@ -200,39 +208,118 @@ def folder_role(name, flags, delim, prefix):
     return None
 
 
+# ---------------------------------------------------------------- errors
+
+class ImapNo(imaplib.IMAP4.error):
+    """Server answered NO to a command (the command did not take effect)."""
+
+
+def classify(exc):
+    """-> (category, retryable). Transient errors are retried with backoff;
+    permanent ones need operator action."""
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return "tls_certificate", False
+    if isinstance(exc, ssl.SSLError):
+        return "tls", True  # handshake reset etc.; certificate problems are caught above
+    if isinstance(exc, socket.gaierror):
+        return "dns", True
+    if isinstance(exc, ConnectionRefusedError):
+        return "connection_refused", True
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return "timeout", True
+    if isinstance(exc, (imaplib.IMAP4.abort, OSError, EOFError)):
+        return "connection", True
+    if isinstance(exc, imaplib.IMAP4.error):
+        return classify_text(str(exc))
+    return "internal", False
+
+
+def classify_text(text):
+    t = (text or "").lower()
+    if any(k in t for k in ("authenticationfailed", "authentication failed", "login failed",
+                            "invalid credentials", "authorizationfailed", "incorrect password")):
+        return "auth", False
+    if "overquota" in t or "quota" in t:
+        return "quota", False
+    if any(k in t for k in ("toobig", "too big", "too large", "message size", "size limit", "exceeds")):
+        return "too_large", False
+    if any(k in t for k in ("unavailable", "throttl", "too many", "try again", "temporar", "busy",
+                            "[limit]", "inuse", "[serverbug]")):
+        return "throttled", True
+    if any(k in t for k in ("nonexistent", "doesn't exist", "does not exist", "no such mailbox", "unknown mailbox")):
+        return "missing_mailbox", False
+    return "imap_error", False
+
+
+REMEDIATION = {
+    "auth": "Login rejected. Check the email address and password for this account, then click Sync again.",
+    "tls_certificate": "The server's TLS certificate is invalid, expired or issued to a different name. "
+                       "Do not disable verification: use the secure incoming server hostname from cPanel > "
+                       "Email Accounts > Connect Devices (often like server123.hostingprovider.com). Check it with: "
+                       "openssl s_client -connect HOST:993 -servername HOST -verify_return_error </dev/null",
+    "tls": "TLS handshake failed on port 993. Check the hostname and that the server offers IMAPS on 993.",
+    "quota": "Destination mailbox is full. Increase its quota on the new host, then click Sync again.",
+    "too_large": "The destination rejected this message as too large. Raise the host's limit or save the "
+                 "attachment elsewhere.",
+    "missing_mailbox": "Folder disappeared or cannot be created.",
+}
+
+
+def sanitize(text, secrets=()):
+    """Short, single-line error text with any known secret removed."""
+    s = str(text or "")
+    for sec in secrets:
+        if sec:
+            s = s.replace(sec, "***")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:300]
+
+
 # ---------------------------------------------------------------- connection
 
+IMAPS_PORT = 993
+
+
+def tls_context():
+    """Default context: CERT_REQUIRED, hostname checking, system CA store, modern TLS."""
+    return ssl.create_default_context()
+
+
 class Mailbox:
-    def __init__(self, host, port, user, password, timeout=180):
-        self.host, self.port = host, port
+    def __init__(self, host, port, user, password, security="ssl", timeout=None):
+        if int(port) != IMAPS_PORT or security != "ssl":
+            raise ValueError("Only IMAPS on port 993 is supported (no STARTTLS, no plaintext).")
+        self.host, self.port = host, IMAPS_PORT
         self.user, self.password = user, password
-        self.timeout = timeout
+        self.security = "ssl"
+        self.timeout = timeout or config.IMAP_TIMEOUT
+        self.conn = None
         self.connect()
 
+    def _open(self):
+        """IMAPS with certificate + hostname verification and a socket timeout."""
+        return imaplib.IMAP4_SSL(self.host, IMAPS_PORT, ssl_context=tls_context(), timeout=self.timeout)
+
     def connect(self):
-        if self.port == 143:
-            self.conn = imaplib.IMAP4(self.host, self.port, timeout=self.timeout)
-            try:
-                self.conn.starttls()
-            except Exception:
-                pass
-        else:
-            self.conn = imaplib.IMAP4_SSL(self.host, self.port, timeout=self.timeout)
+        self.conn = self._open()
         self.conn.login(self.user, self.password)
+        try:
+            typ, data = self.conn.capability()
+            caps = data[0].decode().upper().split() if typ == "OK" and data and data[0] else []
+        except Exception:
+            caps = [c.upper() for c in getattr(self.conn, "capabilities", ())]
+        self.capabilities = set(caps)
         self.folders, self.delim = self._list()
         self.prefix = self._namespace_prefix()
         self.roles = {}
-        for name, flags in self.folders.items():
+        for name, flags in sorted(self.folders.items()):
             role = folder_role(name, flags, self.delim, self.prefix)
             if role and role not in self.roles:
                 self.roles[role] = name
 
-    def reconnect(self):
-        try:
-            self.conn.logout()
-        except Exception:
-            pass
-        self.connect()
+    @property
+    def uidplus(self):
+        return "UIDPLUS" in self.capabilities
 
     def close(self):
         try:
@@ -278,171 +365,105 @@ class Mailbox:
             return p
         return ""
 
+    def _resp_int(self, code):
+        try:
+            typ, data = self.conn.response(code)
+            if data and data[-1] is not None:
+                return int(data[-1].split()[0])
+        except Exception:
+            pass
+        return None
+
+    def examine(self, folder):
+        """Open read-only (EXAMINE). -> {uidvalidity, uidnext, exists}"""
+        typ, data = self.conn.select(quote(folder), readonly=True)
+        if typ != "OK":
+            raise ImapNo(f"cannot open folder {folder}: {data}")
+        exists = int(data[0] or 0) if data and data[0] else 0
+        uv, un = self._resp_int("UIDVALIDITY"), self._resp_int("UIDNEXT")
+        if uv is None:
+            typ, data = self.conn.status(quote(folder), "(UIDVALIDITY UIDNEXT)")
+            if typ == "OK" and data and data[0]:
+                m = re.search(rb"UIDVALIDITY (\d+)", data[0])
+                n = re.search(rb"UIDNEXT (\d+)", data[0])
+                uv = int(m.group(1)) if m else None
+                un = int(n.group(1)) if n else un
+        if uv is None:
+            raise ImapNo(f"server did not report UIDVALIDITY for {folder}")
+        return {"uidvalidity": uv, "uidnext": un, "exists": exists}
+
+    def uid_search_all(self):
+        typ, data = self.conn.uid("SEARCH", None, "ALL")
+        if typ != "OK":
+            raise ImapNo(f"UID SEARCH failed: {data}")
+        return sorted({int(x) for part in data if part for x in part.split()})
+
+    def fetch_meta(self, uids, chunk=500):
+        """Yield metadata dicts (uid, size, idate, epoch, mid, flags) for the selected folder."""
+        for uset in uid_sets(uids, chunk):
+            typ, data = self.conn.uid("FETCH", uset, META_ITEMS)
+            if typ != "OK":
+                raise ImapNo(f"FETCH failed: {data}")
+            for meta, lit in parse_fetch(data):
+                m = parse_meta(meta, lit)
+                if m:
+                    yield m
+
+    def fetch_message(self, uid):
+        """-> (flags list, internaldate str, raw bytes), or None if the UID no longer exists."""
+        typ, data = self.conn.uid("FETCH", str(uid), "(UID FLAGS INTERNALDATE BODY.PEEK[])")
+        if typ != "OK":
+            raise ImapNo(f"FETCH failed: {data}")
+        for meta, raw in parse_fetch(data):
+            m = re.search(rb"UID (\d+)", meta)
+            if (m and int(m.group(1)) != uid) or (not m and not raw):
+                continue  # unsolicited FETCH (e.g. a flag update for another message)
+            fl = re.search(rb"FLAGS \(([^)]*)\)", meta)
+            flags = [f for f in (fl.group(1).decode().split() if fl else []) if f.lower() != "\\recent"]
+            idate = re.search(rb'INTERNALDATE "([^"]+)"', meta)
+            return flags, (idate.group(1).decode() if idate else None), raw
+        return None
+
+    def scan_attachments(self, uids):
+        """Total attachments in uids of the selected folder (structure only, no bodies)."""
+        total = 0
+        for uset in uid_sets(uids):
+            typ, data = self.conn.uid("FETCH", uset, "(BODYSTRUCTURE)")
+            if typ != "OK":
+                continue
+            buf = b" ".join(p[0] + b"\r\n" + p[1] if isinstance(p, tuple) else p for p in data if p)
+            for item in parse_sexp(buf):
+                if isinstance(item, list):
+                    total += count_attachments(pairs(item).get("bodystructure"))
+        return total
+
     def ensure_folder(self, name):
         if name in self.folders or name.upper() == "INBOX":
             return
         typ, resp = self.conn.create(quote(name))
-        if typ != "OK" and b"exist" not in b" ".join(r or b"" for r in resp).lower():
-            raise imaplib.IMAP4.error(f"cannot create folder {name}: {resp}")
+        text = b" ".join(r or b"" for r in resp).decode("utf-8", "replace")
+        if typ != "OK" and "exist" not in text.lower():
+            raise ImapNo(f"cannot create folder {name}: {text}")
         try:
             self.conn.subscribe(quote(name))
         except Exception:
             pass
         self.folders[name] = set()
 
-
-def map_folder(name, flags, src, dst):
-    if name.upper() == "INBOX":
-        return "INBOX"
-    role = folder_role(name, flags, src.delim, src.prefix)
-    if role and role in dst.roles:
-        return dst.roles[role]
-    rel = name[len(src.prefix):] if src.prefix and name.startswith(src.prefix) else name
-    parts = rel.split(src.delim) if src.delim else [rel]
-    parts = [p.replace(dst.delim, "_") for p in parts]
-    return dst.prefix + dst.delim.join(parts)
-
-
-def fetch_index(conn, folder):
-    """Return {message_key: (uid, size)} for every message in folder."""
-    typ, data = conn.select(quote(folder), readonly=True)
-    if typ != "OK":
-        raise imaplib.IMAP4.error(f"cannot open {folder}: {data}")
-    if int(data[0] or 0) == 0:
-        return {}
-    typ, data = conn.uid(
-        "FETCH", "1:*", "(RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])"
-    )
-    index = {}
-    for meta, lit in parse_fetch(data):
-        uid = re.search(rb"UID (\d+)", meta)
-        size = re.search(rb"RFC822\.SIZE (\d+)", meta)
-        idate = re.search(rb'INTERNALDATE "([^"]+)"', meta)
-        if not uid:
-            continue
-        n = int(size.group(1)) if size else 0
-        key = message_key(lit, n, idate.group(1) if idate else b"")
-        index.setdefault(key, (int(uid.group(1)), n))
-    return index
-
-
-def scan_attachments(conn, uids):
-    """Return total attachments in uids of the selected folder (structure only, no bodies)."""
-    total = 0
-    for uset in uid_sets(uids):
-        typ, data = conn.uid("FETCH", uset, "(BODYSTRUCTURE)")
+    def append(self, folder, flags, idate, raw):
+        """APPEND one message. -> (ok, dest_uidvalidity, dest_uid, response_text).
+        ok=False means the server answered NO, so the message was NOT stored.
+        Connection errors are raised: the outcome is then unknown."""
+        date = f'"{idate}"' if idate else None
+        typ, resp = self.conn.append(quote(folder), " ".join(flags) or None, date, raw)
+        text = b" ".join(r or b"" for r in (resp or [])).decode("utf-8", "replace")
         if typ != "OK":
-            continue
-        buf = b" ".join(p[0] + b"\r\n" + p[1] if isinstance(p, tuple) else p for p in data if p)
-        for item in parse_sexp(buf):
-            if isinstance(item, list):
-                total += count_attachments(pairs(item).get("bodystructure"))
-    return total
+            return False, None, None, text
+        m = APPENDUID_RE.search(" ".join(text.split()).encode())
+        return True, (int(m.group(1)) if m else None), (int(m.group(2)) if m else None), text
 
 
-def fetch_summaries(conn, uids):
-    """Return {uid: {date, from, subject}} for uids of the selected folder."""
-    out = {}
-    for uset in uid_sets(uids):
-        typ, data = conn.uid("FETCH", uset, "(BODY.PEEK[HEADER.FIELDS (DATE FROM SUBJECT)])")
-        if typ != "OK":
-            continue
-        for meta, lit in parse_fetch(data):
-            uid = re.search(rb"UID (\d+)", meta)
-            if not uid:
-                continue
-            msg = email.message_from_bytes(lit or b"", policy=email.policy.default)
-            rec = {}
-            for h in ("date", "from", "subject"):
-                try:
-                    rec[h] = str(msg.get(h, "") or "")
-                except Exception:
-                    rec[h] = "?"
-            out[int(uid.group(1))] = rec
-    return out
-
-
-# ---------------------------------------------------------------- copy logic
-
-def copy_one(src, dst, uid, dname):
-    typ, data = src.conn.uid("FETCH", str(uid), "(FLAGS INTERNALDATE BODY.PEEK[])")
-    parts = parse_fetch(data)
-    if typ != "OK" or not parts:
-        raise imaplib.IMAP4.error(f"fetch failed: {data}")
-    meta, raw = parts[0]
-    fl = re.search(rb"FLAGS \(([^)]*)\)", meta)
-    flags = [f for f in (fl.group(1).decode().split() if fl else []) if f.lower() != "\\recent"]
-    idate = re.search(rb'INTERNALDATE "([^"]+)"', meta)
-    date = f'"{idate.group(1).decode()}"' if idate else None
-    typ, resp = dst.conn.append(quote(dname), " ".join(flags) or None, date, raw)
-    if typ != "OK":
-        raise imaplib.IMAP4.error(f"append rejected: {resp}")
-
-
-def copy_folder(src, dst, sname, sflags, dname, log, dry, progress=None, stop=None, big_bytes=0):
-    """Copy missing messages. Returns (copied, failed, stats) where stats holds
-    bytes / attachments / big for the messages that needed copying."""
-    src_index = fetch_index(src.conn, sname)
-    if not dry:
-        dst.ensure_folder(dname)
-    dst_keys = set(fetch_index(dst.conn, dname)) if dname in dst.folders or dname == "INBOX" else set()
-    todo = sorted(v for key, v in src_index.items() if key not in dst_keys)  # [(uid, size)]
-    stats = {"bytes": sum(s for _, s in todo), "attachments": 0, "big": []}
-
-    # src.conn is still on sname (read only) after fetch_index
-    if dry and todo:
-        stats["attachments"] = scan_attachments(src.conn, [u for u, _ in todo])
-    big = [(u, s) for u, s in todo if big_bytes and s >= big_bytes]
-    if big:
-        info = fetch_summaries(src.conn, [u for u, _ in big])
-        stats["big"] = [{"folder": sname, "uid": u, "size": s, **info.get(u, {})}
-                        for u, s in sorted(big, key=lambda x: -x[1])]
-
-    msg = f"{sname} -> {dname}: {len(src_index)} on source, {len(todo)} to copy ({fmt_size(stats['bytes'])}"
-    if dry:
-        msg += f", {stats['attachments']} attachments"
-    log.info(msg + ")")
-    for b in stats["big"]:
-        log.warning(f"  large email {fmt_size(b['size'])} in {sname}: {b.get('subject', '')!r}")
-    if progress:
-        progress("folder", sname, len(todo), stats["bytes"], stats["attachments"], stats["big"])
-    if dry or not todo:
-        return len(todo), 0, stats
-
-    src.conn.select(quote(sname), readonly=True)
-    copied = failed = 0
-    for i, (uid, size) in enumerate(todo, 1):
-        if stop is not None and stop.is_set():
-            log.warning(f"{sname}: stopped by user")
-            break
-        for attempt in (1, 2):
-            try:
-                copy_one(src, dst, uid, dname)
-                copied += 1
-                if progress:
-                    progress("copied", sname, size)
-                break
-            except (imaplib.IMAP4.abort, OSError) as e:  # connection dropped
-                if attempt == 2:
-                    failed += 1
-                    if progress:
-                        progress("failed", sname, size)
-                    log.warning(f"  uid {uid} failed after reconnect: {e}")
-                    break
-                log.warning(f"  connection lost ({e}), reconnecting")
-                src.reconnect()
-                dst.reconnect()
-                src.conn.select(quote(sname), readonly=True)
-            except imaplib.IMAP4.error as e:  # message rejected (too big etc.)
-                failed += 1
-                if progress:
-                    progress("failed", sname, size)
-                log.warning(f"  uid {uid} skipped: {e}")
-                break
-        if i % 100 == 0:
-            log.info(f"  {sname}: {i}/{len(todo)}")
-    return copied, failed, stats
-
+# ---------------------------------------------------------------- folder planning
 
 def should_skip(name, flags, mbox, skip):
     if not skip:
@@ -452,153 +473,98 @@ def should_skip(name, flags, mbox, skip):
     candidates = {name.lower(), rel.lower()}
     if role:
         candidates.add(role.lstrip("\\"))
-    return bool(candidates & skip)
+    return bool(candidates & {s.lower() for s in skip})
 
 
-def make_logger(user, log_dir):
-    log = logging.getLogger(user)
-    if log.handlers:
-        return log
-    log.setLevel(logging.INFO)
-    fmt = logging.Formatter(f"%(asctime)s [{user}] %(levelname)s %(message)s", "%H:%M:%S")
-    safe = re.sub(r"[^\w.@-]", "_", user)
-    fh = logging.FileHandler(Path(log_dir) / (safe + ".log"))
-    fh.setFormatter(fmt)
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt)
-    log.addHandler(fh)
-    log.addHandler(sh)
-    return log
+def translate_name(name, src, dst):
+    rel = name[len(src.prefix):] if src.prefix and name.startswith(src.prefix) else name
+    parts = rel.split(src.delim) if src.delim else [rel]
+    parts = [p.replace(dst.delim, "_") if dst.delim else p for p in parts]
+    return dst.prefix + dst.delim.join(parts)
 
 
-def migrate_account(row, args):
-    su, sp = row["src_user"].strip(), row["src_pass"]
-    du = (row.get("dst_user") or "").strip() or su
-    dp = row.get("dst_pass") or sp
-    log = make_logger(su, args.log_dir)
-    result = {"account": su, "folders": 0, "copied": 0, "failed": 0, "bytes": 0,
-              "attachments": 0, "big": [], "status": "ok", "error": ""}
-    big_bytes = int(getattr(args, "big_mb", 25) * MB)
-    src = dst = None
-    t0 = time.time()
-    hook = getattr(args, "progress", None)
-    progress = (lambda *a: hook(su, *a)) if hook else None
-    stop = getattr(args, "stop_event", None)
-    try:
-        src = Mailbox(args.src_host, args.src_port, su, sp)
-        dst = Mailbox(args.dst_host, args.dst_port, du, dp)
-        log.info(f"connected. source delim '{src.delim}' prefix '{src.prefix}', "
-                 f"dest delim '{dst.delim}' prefix '{dst.prefix}'")
-        if progress:
-            progress("start")
-        for sname, sflags in sorted(src.folders.items()):
-            if stop is not None and stop.is_set():
-                result["status"] = "stopped"
-                break
-            if should_skip(sname, sflags, src, args.skip):
-                log.info(f"{sname}: skipped")
-                continue
-            dname = map_folder(sname, sflags, src, dst)
-            try:
-                c, f, st = copy_folder(src, dst, sname, sflags, dname, log, args.dry_run,
-                                       progress, stop, big_bytes)
-                result["folders"] += 1
-                result["copied"] += c
-                result["failed"] += f
-                result["bytes"] += st["bytes"]
-                result["attachments"] += st["attachments"]
-                result["big"] += [dict(b, account=su) for b in st["big"]]
-            except imaplib.IMAP4.error as e:
-                log.error(f"{sname}: folder failed: {e}")
-                result["status"] = "partial"
-        if stop is not None and stop.is_set():
-            result["status"] = "stopped"
-        elif result["failed"]:
-            result["status"] = "partial"
-    except Exception as e:
-        log.error(f"account failed: {e}")
-        result.update(status="error", error=str(e))
-    finally:
-        for m in (src, dst):
-            if m:
-                m.close()
-    verb = "would copy" if args.dry_run else "copied"
-    extra = f", {result['attachments']} attachments" if args.dry_run else ""
-    log.info(f"done in {time.time() - t0:.0f}s: {verb} {result['copied']} ({fmt_size(result['bytes'])}{extra}), "
-             f"failed {result['failed']}, large emails {len(result['big'])}")
-    return result
+def plan_folders(src, dst, skip=(), existing=None):
+    """-> [(source_name, flags, destination_name)], INBOX first.
+
+    Every source folder gets its OWN destination folder: special folders map to
+    the destination's Sent/Trash/Junk/... only once, and any name collision gets a
+    " (2)" suffix instead of merging. `existing` ({source: destination}) keeps
+    mappings chosen on an earlier pass stable."""
+    existing = dict(existing or {})
+    used = {d.lower() for d in existing.values()}
+    plan = []
+    names = sorted(src.folders, key=lambda n: (n.upper() != "INBOX", n))
+    for sname in names:
+        flags = src.folders[sname]
+        if should_skip(sname, flags, src, skip):
+            continue
+        if sname in existing:
+            plan.append((sname, flags, existing[sname]))
+            continue
+        dname = None
+        if sname.upper() == "INBOX":
+            dname = "INBOX"
+        else:
+            role = folder_role(sname, flags, src.delim, src.prefix)
+            if role and role in dst.roles and dst.roles[role].lower() not in used:
+                dname = dst.roles[role]
+            if dname is None:
+                dname = translate_name(sname, src, dst)
+        base, n = dname, 2
+        while dname.lower() in used:
+            dname = f"{base} ({n})"
+            n += 1
+        used.add(dname.lower())
+        plan.append((sname, flags, dname))
+    return plan
 
 
-# ---------------------------------------------------------------- main
+# ---------------------------------------------------------------- destination index
 
-def main():
-    ap = argparse.ArgumentParser(description="Copy mailboxes between IMAP servers.")
-    ap.add_argument("--src-host", required=True)
-    ap.add_argument("--src-port", type=int, default=993)
-    ap.add_argument("--dst-host", required=True)
-    ap.add_argument("--dst-port", type=int, default=993)
-    ap.add_argument("--accounts", required=True, help="CSV: src_user,src_pass,dst_user,dst_pass")
-    ap.add_argument("--workers", type=int, default=2)
-    ap.add_argument("--skip", default="", help="comma list, e.g. trash,junk")
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--big-mb", type=float, default=25, help="flag emails at least this big (MB)")
-    ap.add_argument("--log-dir", default="logs")
-    args = ap.parse_args()
-    args.skip = {s.strip().lower() for s in args.skip.split(",") if s.strip()}
-    Path(args.log_dir).mkdir(exist_ok=True)
-    socket.setdefaulttimeout(180)
+class DestIndex:
+    """In-memory view of ONE destination folder (uid -> Message-ID, size, date),
+    used to match source messages to destination copies. Each destination
+    message can be claimed by at most one source message, so duplicates on
+    either side are counted correctly."""
 
-    with open(args.accounts, newline="", encoding="utf-8-sig") as f:
-        rows = [r for r in csv.DictReader(f) if (r.get("src_user") or "").strip()]
-    if not rows:
-        sys.exit("No accounts found in CSV.")
+    def __init__(self, metas=()):
+        self.by_uid = {}
+        self.by_key = defaultdict(list)
+        self.by_mid = defaultdict(list)
+        self.claimed = set()
+        for m in metas:
+            self.add(m)
 
-    results = []
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = [pool.submit(migrate_account, r, args) for r in rows]
-        for fut in as_completed(futures):
-            results.append(fut.result())
+    def add(self, m):
+        self.by_uid[m["uid"]] = (m["mid"], m["size"], m["epoch"])
+        self.by_key[(m["mid"], m["size"], m["epoch"])].append(m["uid"])
+        if m["mid"]:
+            self.by_mid[m["mid"]].append(m["uid"])
 
-    results.sort(key=lambda r: r["account"])
-    summary = Path(args.log_dir) / "summary.csv"
-    with open(summary, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["account", "folders", "emails", "size_mb", "attachments", "large_emails",
-                    "failed", "status", "error"])
-        for r in results:
-            w.writerow([r["account"], r["folders"], r["copied"], round(r["bytes"] / MB, 1),
-                        r["attachments"] if args.dry_run else "", len(r["big"]),
-                        r["failed"], r["status"], r["error"]])
+    def __len__(self):
+        return len(self.by_uid)
 
-    big = [b for r in results for b in r["big"]]
-    if big:
-        big_csv = Path(args.log_dir) / "large_emails.csv"
-        with open(big_csv, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["account", "folder", "size_mb", "date", "from", "subject"])
-            for b in big:
-                w.writerow([b["account"], b["folder"], round(b["size"] / MB, 1),
-                            b.get("date", ""), b.get("from", ""), b.get("subject", "")])
+    def claim(self, uid):
+        self.claimed.add(uid)
 
-    verb = "to copy" if args.dry_run else "copied"
-    print("\n=== SUMMARY ===")
-    for r in results:
-        att = f" attachments={r['attachments']}" if args.dry_run else ""
-        print(f"{r['account']:40} {r['status']:8} {verb}={r['copied']:<7} size={fmt_size(r['bytes']):>10}"
-              f"{att} large={len(r['big'])} failed={r['failed']} {r['error']}")
-    total = sum(r["bytes"] for r in results)
-    print(f"\nTotal {verb}: {sum(r['copied'] for r in results)} emails, {fmt_size(total)}", end="")
-    print(f", {sum(r['attachments'] for r in results)} attachments" if args.dry_run else "")
-    if big:
-        print(f"{len(big)} email(s) over {args.big_mb:g} MB, listed in {big_csv}. "
-              "The new host may reject these; check its max message size.")
-    if args.dry_run:
-        fast, slow = estimate_seconds([{"bytes": r["bytes"], "count": r["copied"]} for r in results],
-                                      args.workers)
-        print(f"Estimated copy time: {fmt_duration(fast)} to {fmt_duration(slow)} "
-              f"with --workers {args.workers} (rough, depends on both servers).")
-    print(f"\nSaved to {summary}. Delete accounts.csv when finished (it holds passwords).")
+    def take_exact(self, mid, size, epoch):
+        for uid in self.by_key.get((mid, size, epoch), ()):
+            if uid not in self.claimed:
+                self.claimed.add(uid)
+                return uid
+        return None
+
+    def unclaimed_by_mid(self, mid):
+        return [u for u in self.by_mid.get(mid, ()) if u not in self.claimed] if mid else []
+
+    def unclaimed_similar_no_mid(self, size, epoch):
+        """Destination messages without a Message-ID sharing size OR date: weak evidence."""
+        return [u for u, (mid, s, e) in self.by_uid.items()
+                if u not in self.claimed and mid is None and (s == size or (epoch and e == epoch))]
 
 
-if __name__ == "__main__":
-    main()
+def load_dest_index(mbox, folder):
+    """EXAMINE folder on mbox and index it. -> (uidvalidity, DestIndex)"""
+    info = mbox.examine(folder)
+    uids = mbox.uid_search_all() if info["exists"] else []
+    return info["uidvalidity"], DestIndex(mbox.fetch_meta(uids) if uids else ())
