@@ -1,0 +1,30 @@
+# secrets
+.env
+*.env
+!.env.example
+*.key
+
+# runtime data (SQLite DB + WAL/SHM, logs, spool)
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+logs/
+*.log
+
+# credential CSVs (contain plaintext passwords)
+*.csv
+!tests/fixtures/*.csv
+
+# python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# os / editor
+.DS_Store
+.vscode/
+.idea/
