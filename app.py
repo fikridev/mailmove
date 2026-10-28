@@ -1,417 +1,370 @@
 """
-MailMove : Streamlit front end for mailmove.py
-Copy mailboxes between any two IMAP servers (different hosting).
+MailMove v2 : Streamlit dashboard.
 
-Run:
-    pip install -r requirements.txt
-    streamlit run app.py
+The dashboard never copies mail itself. It saves jobs (with encrypted
+passwords) to SQLite and shows their progress; worker.py does the copying,
+so restarting or closing this page does not stop a migration.
+
+Run (VPS): systemd unit mailmove-dashboard, bound to 127.0.0.1:8501 (SSH tunnel)
+Run (local): streamlit run app.py   (with worker.py running in another terminal)
 """
 import io
-import logging
-import threading
+import json
 import time
-import types
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
+import config
+import crypto
+import database as db
 import mailmove as mm
 
 st.set_page_config(page_title="MailMove", page_icon="📬", layout="wide")
 
-COLUMNS = ["src_user", "src_pass", "dst_user", "dst_pass"]
-LOG_DIR = Path("logs")
-LOG_DIR.mkdir(exist_ok=True)
+STATUS_ICON = {"queued": "⏳ queued", "running": "🔄 running", "retrying": "🔁 retrying", "pausing": "⏸ pausing",
+               "paused": "⏸ paused", "cancelling": "⏹ cancelling", "cancelled": "⏹ cancelled",
+               "completed": "✅ completed", "completed_with_errors": "⚠️ completed with errors", "failed": "❌ failed"}
 
 
-# ------------------------------------------------------------------ job state
-
-class UILogHandler(logging.Handler):
-    """Sends script log lines into the running job so the UI can show them."""
-
-    def __init__(self, job):
-        super().__init__()
-        self.job = job
-        self.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s", "%H:%M:%S"))
-
-    def emit(self, record):
-        try:
-            self.job.logs.append(self.format(record))
-        except Exception:
-            pass
+@st.cache_resource
+def get_conn(path):
+    return db.init_db(path)
 
 
-class Job:
-    def __init__(self, rows, cfg):
-        self.lock = threading.Lock()
-        self.stop = threading.Event()
-        self.dry_run = cfg["dry_run"]
-        self.workers = cfg["workers"]
-        self.big_mb = cfg["big_mb"]
-        self.started = time.time()
-        self.finished = None
-        self.logs = deque(maxlen=800)
-        self.big = []
-        self.accounts = {
-            r["src_user"]: {"status": "queued", "folder": "", "to_copy": 0, "copied": 0,
-                            "failed": 0, "bytes_todo": 0, "bytes_done": 0, "attachments": 0,
-                            "big": 0, "error": ""}
-            for r in rows
-        }
-
-    def hook(self, user, event, *data):
-        with self.lock:
-            a = self.accounts[user]
-            if event == "start":
-                a["status"] = "running"
-            elif event == "folder":
-                name, n, nbytes, natt, big = data
-                a["folder"] = name
-                a["to_copy"] += n
-                a["bytes_todo"] += nbytes
-                a["attachments"] += natt
-                a["big"] += len(big)
-                self.big += [dict(b, account=user) for b in big]
-            elif event in ("copied", "failed"):
-                a[event] += 1
-                a["bytes_done"] += data[1]
-
-    def finish_account(self, res):
-        with self.lock:
-            a = self.accounts[res["account"]]
-            a.update(status=res["status"], error=res["error"], folder="")
-            if self.dry_run:
-                a["copied"] = 0
-            a["failed"] = res["failed"]
-
-    def snapshot(self):
-        with self.lock:
-            return {k: dict(v) for k, v in self.accounts.items()}, list(self.big)
-
-    @property
-    def running(self):
-        return self.finished is None
-
-
-def run_job(job, rows, args):
-    def one(row):
-        if job.stop.is_set():
-            return {"account": row["src_user"], "folders": 0, "copied": 0,
-                    "failed": 0, "status": "stopped", "error": ""}
-        return mm.migrate_account(row, args)
-
-    try:
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = [pool.submit(one, r) for r in rows]
-            for fut in as_completed(futures):
-                try:
-                    job.finish_account(fut.result())
-                except Exception as e:  # should not happen, migrate_account catches
-                    job.logs.append(f"ERROR worker crashed: {e}")
-    finally:
-        job.finished = time.time()
-
-
-def start_job(rows, cfg):
-    job = Job(rows, cfg)
-    # route every account's log lines into this job (replacing any previous run's handler)
-    for r in rows:
-        log = mm.make_logger(r["src_user"], str(LOG_DIR))
-        for h in list(log.handlers):
-            if isinstance(h, UILogHandler):
-                log.removeHandler(h)
-        log.addHandler(UILogHandler(job))
-    args = types.SimpleNamespace(
-        src_host=cfg["src_host"], src_port=cfg["src_port"],
-        dst_host=cfg["dst_host"], dst_port=cfg["dst_port"],
-        workers=cfg["workers"], skip=set(cfg["skip"]), dry_run=cfg["dry_run"], big_mb=cfg["big_mb"],
-        log_dir=str(LOG_DIR), progress=job.hook, stop_event=job.stop,
-    )
-    threading.Thread(target=run_job, args=(job, rows, args), daemon=True).start()
-    return job
-
-
-# ------------------------------------------------------------------ helpers
-
-def clean_rows(df):
-    rows = []
-    for rec in df.fillna("").to_dict("records"):
-        rec = {c: str(rec.get(c, "")).strip() for c in COLUMNS}
-        if rec["src_user"]:
-            rows.append(rec)
-    return rows
-
-
-def validate(cfg, rows):
-    problems = []
-    if not cfg["src_host"]:
-        problems.append("Source host is empty.")
-    if not cfg["dst_host"]:
-        problems.append("Destination host is empty.")
-    if not rows:
-        problems.append("Add at least one account.")
-    for r in rows:
-        if not r["src_pass"]:
-            problems.append(f"{r['src_user']}: source password missing.")
-    users = [r["src_user"].lower() for r in rows]
-    dupes = {u for u in users if users.count(u) > 1}
-    if dupes:
-        problems.append("Duplicate accounts: " + ", ".join(sorted(dupes)))
-    return problems
-
-
-def test_connection(cfg, row):
-    out = {}
-    for side, host, port, user, pw in (
-        ("Source", cfg["src_host"], cfg["src_port"], row["src_user"], row["src_pass"]),
-        ("Destination", cfg["dst_host"], cfg["dst_port"],
-         row["dst_user"] or row["src_user"], row["dst_pass"] or row["src_pass"]),
-    ):
-        try:
-            mb = mm.Mailbox(host, port, user, pw, timeout=30)
-            out[side] = (True, mb)
-            mb.close()
-        except Exception as e:
-            out[side] = (False, str(e))
-    return out
-
-
-# ------------------------------------------------------------------ session
-
+conn = get_conn(config.db_path())
 ss = st.session_state
-ss.setdefault("accounts_df", pd.DataFrame([{c: "" for c in COLUMNS}]))
+ss.setdefault("pending_accounts", [])   # plaintext only in this browser session, until the job is created
 ss.setdefault("upload_id", None)
 ss.setdefault("up_n", 0)
-ss.setdefault("job", None)
-job = ss.job
-busy = job is not None and job.running
+ss.setdefault("job_id", None)
 
-# ------------------------------------------------------------------ layout
+
+def ago(ts):
+    if not ts:
+        return ""
+    s = time.time() - ts
+    return "just now" if s < 5 else f"{mm.fmt_duration(s)} ago" if s >= 60 else f"{int(s)}s ago"
+
+
+# ------------------------------------------------------------------ header
 
 st.title("📬 MailMove")
-st.caption("Copy every mailbox from one email host to another over IMAP. "
-           "The old server is read only, and re-running only copies what is missing.")
+st.caption("Copies mailboxes between two hosts over IMAP (TLS, port 993). The old server is read-only. "
+           "Progress is saved, so the copy resumes after any disconnect, restart or reboot.")
 
-c1, c2 = st.columns(2)
-with c1:
-    st.subheader("From (old hosting)")
-    src_host = st.text_input("IMAP host", placeholder="mail.oldhost.com", key="src_host", disabled=busy)
-    src_port = st.number_input("Port", value=993, step=1, key="src_port", disabled=busy,
-                               help="993 = SSL (normal). 143 = STARTTLS.")
-with c2:
-    st.subheader("To (new hosting)")
-    dst_host = st.text_input("IMAP host", placeholder="mail.newhost.com", key="dst_host", disabled=busy)
-    dst_port = st.number_input("Port", value=993, step=1, key="dst_port", disabled=busy)
+if not crypto.key_available():
+    st.error("MAILMOVE_KEY is not set, so passwords cannot be stored. On the VPS put it in "
+             "/etc/mailmove/mailmove.env; locally put it in .env. Generate one with "
+             "`python scripts/init_db.py --gen-key`.")
+    st.stop()
 
-with st.expander("Options", expanded=False):
-    o1, o2, o3, o4 = st.columns(4)
-    workers = o1.slider("Mailboxes in parallel", 1, 8, 2, disabled=busy,
-                        help="Keep low (2 to 3) on shared hosting to avoid throttling.")
-    skip = o2.multiselect("Skip folders", ["trash", "junk", "drafts", "archive"],
-                          default=[], disabled=busy,
-                          help="Nothing is skipped by default. \"junk\" also covers Spam folders.")
-    big_mb = o3.number_input("Large email warning (MB)", 1, 500, 25, disabled=busy,
-                             help="Emails this big are listed, since many hosts reject over 25 to 50 MB.")
-    dry_run = o4.toggle("Dry run (count only, copy nothing)", value=True, disabled=busy,
-                        help="Also counts size and attachments, and estimates copy time.")
+hb = db.latest_heartbeat(conn)
+if hb is None or time.time() - hb["last_heartbeat_at"] > config.HEARTBEAT_STALE_SECONDS:
+    st.warning("⚠️ The worker is not running, so queued jobs will not start. "
+               "VPS: `sudo systemctl start mailmove-worker`. Local: `python worker.py`.")
 
-st.subheader("Accounts")
-up = st.file_uploader("Upload CSV (src_user, src_pass, dst_user, dst_pass)", type="csv", disabled=busy,
-                      key=f"uploader_{ss.up_n}")
-if up is not None and up.file_id != ss.upload_id:
-    try:
-        df = pd.read_csv(io.BytesIO(up.getvalue()), dtype=str, encoding="utf-8-sig").fillna("")
-        df.columns = [c.strip().lower() for c in df.columns]
-        missing = [c for c in ("src_user", "src_pass") if c not in df.columns]
-        if missing:
-            st.error(f"CSV is missing column(s): {', '.join(missing)}")
-        else:
-            for c in COLUMNS:
-                if c not in df.columns:
-                    df[c] = ""
-            ss.accounts_df = df[COLUMNS]
+tab_new, tab_jobs = st.tabs(["➕ New job", "📊 Jobs"])
+
+# ------------------------------------------------------------------ new job
+
+with tab_new:
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("From (old hosting)")
+        src_host = st.text_input("IMAP host", placeholder="server123.oldhost.com", key="src_host",
+                                 help="Use the 'Incoming server' from cPanel > Email Accounts > Connect Devices.")
+    with c2:
+        st.subheader("To (new hosting)")
+        dst_host = st.text_input("IMAP host ", placeholder="server456.newhost.com", key="dst_host")
+    st.caption("🔒 IMAPS on port 993 only, with certificate and hostname verification. No insecure fallback.")
+
+    with st.expander("Options"):
+        o1, o2, o3 = st.columns(3)
+        workers = o1.slider("Mailboxes in parallel", 1, 8, 2,
+                            help="Start with 2 on an unstable host. Increase only if it stays healthy.")
+        skip = o2.multiselect("Skip folders", ["trash", "junk", "drafts", "archive"], default=[],
+                              help="Nothing is skipped by default.")
+        big_mb = o3.number_input("Large email warning (MB)", 1, 500, 25)
+
+    st.subheader("Accounts")
+    up = st.file_uploader("Upload CSV (src_user, src_pass, dst_user, dst_pass). Read in memory only, never saved.",
+                          type="csv", key=f"uploader_{ss.up_n}")
+    if up is not None and up.file_id != ss.upload_id:
+        try:
+            df = pd.read_csv(io.BytesIO(up.getvalue()), dtype=str, encoding="utf-8-sig").fillna("")
+            df.columns = [c.strip().lower() for c in df.columns]
+            if not {"src_user", "src_pass"} <= set(df.columns):
+                st.error("CSV needs at least the columns src_user and src_pass.")
+            else:
+                added = 0
+                for rec in df.to_dict("records"):
+                    su = rec.get("src_user", "").strip()
+                    if su:
+                        ss.pending_accounts.append({"src_user": su, "src_pass": rec.get("src_pass", ""),
+                                                    "dst_user": rec.get("dst_user", "").strip(),
+                                                    "dst_pass": rec.get("dst_pass", "")})
+                        added += 1
+                st.success(f"Added {added} account(s). Delete the CSV file from your computer after use.")
             ss.upload_id = up.file_id
-    except Exception as e:
-        st.error(f"Could not read CSV: {e}")
+        except Exception as e:
+            st.error(f"Could not read CSV: {mm.sanitize(e)}")
 
-edited = st.data_editor(
-    ss.accounts_df,
-    num_rows="dynamic",
-    width="stretch",
-    disabled=busy,
-    key=f"editor_{ss.upload_id}",
-    column_config={
-        "src_user": st.column_config.TextColumn("Source email", required=True),
-        "src_pass": st.column_config.TextColumn("Source password"),
-        "dst_user": st.column_config.TextColumn("Destination email", help="Blank = same as source"),
-        "dst_pass": st.column_config.TextColumn("Destination password", help="Blank = same as source"),
-    },
-)
-rows = clean_rows(edited)
-st.caption(f"{len(rows)} account(s). Leave destination fields blank to reuse the source login.")
+    with st.form("add_account", clear_on_submit=True):
+        f1, f2, f3, f4 = st.columns(4)
+        a_su = f1.text_input("Source email")
+        a_sp = f2.text_input("Source password", type="password")
+        a_du = f3.text_input("Destination email", help="Blank = same as source")
+        a_dp = f4.text_input("Destination password", type="password", help="Blank = same as source")
+        if st.form_submit_button("Add account") and a_su.strip():
+            ss.pending_accounts.append({"src_user": a_su.strip(), "src_pass": a_sp,
+                                        "dst_user": a_du.strip(), "dst_pass": a_dp})
 
-cfg = dict(src_host=src_host.strip(), src_port=int(src_port), dst_host=dst_host.strip(),
-           dst_port=int(dst_port), workers=workers, skip=skip, dry_run=dry_run, big_mb=int(big_mb))
+    accts = ss.pending_accounts
+    if accts:
+        st.dataframe(pd.DataFrame([{"Source email": a["src_user"], "Destination email": a["dst_user"] or a["src_user"],
+                                    "Source password": "••••" if a["src_pass"] else "missing",
+                                    "Destination password": "••••" if a["dst_pass"] else "same as source"}
+                                   for a in accts]), hide_index=True, width="stretch")
+        r1, r2 = st.columns([3, 1])
+        remove = r1.multiselect("Remove", [a["src_user"] for a in accts], label_visibility="collapsed",
+                                placeholder="Select accounts to remove")
+        if r2.button("Remove selected", disabled=not remove):
+            ss.pending_accounts = [a for a in accts if a["src_user"] not in remove]
+            st.rerun()
 
-b1, b2, b3, _ = st.columns([1, 1, 1, 3])
-test_clicked = b1.button("🔌 Test connection", disabled=busy, width="stretch")
-start_clicked = b2.button("▶ Dry run" if dry_run else "▶ Start migration", type="primary",
-                          disabled=busy, width="stretch")
-stop_clicked = b3.button("■ Stop", disabled=not busy, width="stretch")
+    def problems():
+        out = []
+        if not src_host.strip():
+            out.append("Source host is empty.")
+        if not dst_host.strip():
+            out.append("Destination host is empty.")
+        if not accts:
+            out.append("Add at least one account.")
+        for a in accts:
+            if not a["src_pass"]:
+                out.append(f"{a['src_user']}: source password missing.")
+        users = [a["src_user"].lower() for a in accts]
+        dupes = sorted({u for u in users if users.count(u) > 1})
+        if dupes:
+            out.append("Duplicate accounts: " + ", ".join(dupes))
+        return out
 
-if test_clicked:
-    problems = [p for p in validate(cfg, rows) if "Duplicate" not in p]
-    if problems:
-        for p in problems:
-            st.error(p)
+    b1, b2, b3, _ = st.columns([1, 1, 1, 2])
+    if b1.button("🔌 Test connection", width="stretch", disabled=not accts):
+        a = accts[0]
+        for side, host, user, pw in (("Source", src_host.strip(), a["src_user"], a["src_pass"]),
+                                     ("Destination", dst_host.strip(), a["dst_user"] or a["src_user"],
+                                      a["dst_pass"] or a["src_pass"])):
+            try:
+                with st.spinner(f"{side}: logging in as {user}..."):
+                    mb = mm.Mailbox(host, 993, user, pw)
+                st.success(f"{side}: TLS certificate valid, logged in as {user}. {len(mb.folders)} folders "
+                           f"(separator '{mb.delim}', prefix '{mb.prefix or 'none'}', UIDPLUS: "
+                           f"{'yes' if mb.uidplus else 'no'})")
+                st.code("\n".join(sorted(mb.folders)), language=None)
+                mb.close()
+            except Exception as e:
+                cat, _ = mm.classify(e)
+                st.error(f"{side}: {cat}: {mm.sanitize(e, (pw,))}")
+                if mm.REMEDIATION.get(cat):
+                    st.info(mm.REMEDIATION[cat])
+
+    def create(dry):
+        errs = problems()
+        if errs:
+            for p in errs:
+                st.error(p)
+            return
+        cfg = dict(source_host=src_host.strip(), source_port=993, destination_host=dst_host.strip(),
+                   destination_port=993, dry_run=dry, max_parallel_accounts=workers, skip_folders=skip,
+                   large_message_threshold_bytes=int(big_mb) * mm.MB)
+        rows = [dict(source_user=a["src_user"], destination_user=a["dst_user"] or a["src_user"],
+                     encrypted_source_password=crypto.encrypt(a["src_pass"]),
+                     encrypted_destination_password=crypto.encrypt(a["dst_pass"] or a["src_pass"])) for a in accts]
+        name = f"{'Dry run' if dry else 'Migration'} {src_host.strip()} → {dst_host.strip()} ({len(rows)} accounts)"
+        ss.job_id = db.create_job(conn, name, cfg, rows)
+        ss.pending_accounts = []      # plaintext passwords leave the session once encrypted
+        ss.up_n += 1
+        st.success(f"Job #{ss.job_id} queued. Open the Jobs tab to follow it.")
+
+    if b2.button("🔍 Start dry run", width="stretch"):
+        create(True)
+    if b3.button("▶ Start migration", type="primary", width="stretch"):
+        create(False)
+    st.caption("Dry run counts emails, size, attachments and large emails without copying anything.")
+
+# ------------------------------------------------------------------ jobs
+
+with tab_jobs:
+    jobs = conn.execute("SELECT id, name, status, dry_run FROM migration_jobs ORDER BY id DESC LIMIT 50").fetchall()
+    if not jobs:
+        st.info("No jobs yet.")
     else:
-        with st.spinner(f"Logging in as {rows[0]['src_user']} on both servers..."):
-            res = test_connection(cfg, rows[0])
-        tc1, tc2 = st.columns(2)
-        for col, side in ((tc1, "Source"), (tc2, "Destination")):
-            ok, val = res[side]
-            with col:
-                if ok:
-                    st.success(f"{side}: connected, {len(val.folders)} folders "
-                               f"(separator '{val.delim}', prefix '{val.prefix or 'none'}')")
-                    st.code("\n".join(sorted(val.folders)) or "(none)", language=None)
+        ids = [j["id"] for j in jobs]
+        labels = {j["id"]: f"#{j['id']} {STATUS_ICON.get(j['status'], j['status'])} · {j['name']}" for j in jobs}
+        default = ids.index(ss.job_id) if ss.job_id in ids else 0
+        ss.job_id = st.selectbox("Job", ids, index=default, format_func=lambda i: labels[i])
+
+        @st.fragment(run_every=3)
+        def job_view(job_id):
+            c = db.connect()
+            job = db.get_job(c, job_id)
+            dry = bool(job["dry_run"])
+            st.subheader(f"{'Dry run' if dry else 'Migration'} #{job_id}: {STATUS_ICON.get(job['status'], job['status'])}"
+                         + (f" (pass {job['pass_number']})" if job["pass_number"] > 1 else ""))
+            st.caption(f"{job['source_host']} → {job['destination_host']} · {job['max_parallel_accounts']} in parallel · "
+                       f"skip: {', '.join(json.loads(job['skip_folders_json'])) or 'nothing'} · "
+                       f"worker heartbeat {ago(job['last_heartbeat_at'])}")
+            if job["last_error"]:
+                st.error(job["last_error"])
+
+            # controls
+            k1, k2, k3, k4, _ = st.columns([1, 1, 1, 1.4, 1.6])
+            s = job["status"]
+            try:
+                if k1.button("⏸ Pause", disabled=s not in ("queued", "running", "retrying"), key=f"p{job_id}"):
+                    db.request_pause(c, job_id)
+                    st.rerun()
+                if k2.button("▶ Resume", disabled=s != "paused", key=f"r{job_id}"):
+                    db.request_resume(c, job_id)
+                    st.rerun()
+                if k3.button("⏹ Cancel", disabled=s not in ("queued", "paused", "running", "retrying", "pausing"),
+                             key=f"c{job_id}"):
+                    db.request_cancel(c, job_id)
+                    st.rerun()
+                if not dry and k4.button("🔁 Sync again", disabled=s not in db.JOB_TERMINAL, key=f"s{job_id}",
+                                         help="Rescan every folder and copy only new or failed mail. Use after "
+                                              "the MX cutover. Never deletes destination mail."):
+                    db.request_sync_again(c, job_id)
+                    st.rerun()
+                if dry and k4.button("▶ Start migration from this", disabled=s not in db.JOB_TERMINAL,
+                                     key=f"m{job_id}", type="primary"):
+                    ss.job_id = db.clone_job(c, job_id, dry_run=False)
+                    st.rerun(scope="app")
+            except (db.InvalidTransition, RuntimeError) as e:
+                st.error(str(e))
+
+            stats = db.job_message_stats(c, job_id)
+            accounts = db.accounts_for_report(c, job_id)
+
+            def tot(status, idx=0, acc=None):
+                rows = [stats.get(acc, {})] if acc else stats.values()
+                return sum(r.get(status, (0, 0))[idx] for r in rows)
+
+            if dry:
+                to_copy, to_bytes = tot("pending"), tot("pending", 1)
+                present = c.execute(
+                    "SELECT COUNT(*) FROM migration_messages m JOIN migration_folders f ON f.id=m.folder_id"
+                    " JOIN migration_accounts a ON a.id=f.account_id WHERE a.job_id=? AND m.skip_reason="
+                    "'already_on_destination'", (job_id,)).fetchone()[0]
+                large = c.execute(
+                    "SELECT COUNT(*) FROM migration_messages m JOIN migration_folders f ON f.id=m.folder_id"
+                    " JOIN migration_accounts a ON a.id=f.account_id WHERE a.job_id=? AND m.status='pending'"
+                    " AND m.source_rfc822_size>=?", (job_id, job["large_message_threshold_bytes"])).fetchone()[0]
+                m = st.columns(5)
+                m[0].metric("Accounts done", f"{sum(a['status'] in ('completed', 'completed_with_errors', 'failed') for a in accounts)}/{len(accounts)}")
+                m[1].metric("Emails to copy", f"{to_copy:,}")
+                m[2].metric("Size to copy", mm.fmt_size(to_bytes))
+                m[3].metric("Attachments", f"{sum(a['attachments'] for a in accounts):,}")
+                m[4].metric(f"Emails ≥ {job['large_message_threshold_bytes'] // mm.MB} MB", f"{large:,}")
+                if present:
+                    st.caption(f"{present:,} email(s) already exist on the destination and will not be copied again.")
+                if to_copy:
+                    per = [{"bytes": tot("pending", 1, a["id"]), "count": tot("pending", 0, a["id"])} for a in accounts]
+                    fast, slow = mm.estimate_seconds(per, job["max_parallel_accounts"])
+                    st.info(f"⏱ **Estimate** (not measured): {mm.fmt_duration(fast)} to {mm.fmt_duration(slow)}, "
+                            "assuming 1 to 4 MB/s. The real speed shows during the migration.")
+            else:
+                verified, vbytes = tot("verified"), tot("verified", 1)
+                unverified = tot("copied_unverified")
+                remaining = sum(tot(x) for x in ("pending", "retrying", "in_progress"))
+                rem_bytes = sum(tot(x, 1) for x in ("pending", "retrying", "in_progress"))
+                failed, review = tot("failed"), tot("needs_review")
+                total = verified + unverified + remaining + failed + review
+                speed = db.recent_throughput(c, job_id)
+                m = st.columns(6)
+                m[0].metric("Verified", f"{verified:,} / {total:,}")
+                m[1].metric("Size verified", mm.fmt_size(vbytes))
+                m[2].metric("Remaining", f"{remaining:,} ({mm.fmt_size(rem_bytes)})")
+                m[3].metric("Failed", f"{failed:,}")
+                m[4].metric("Needs review", f"{review:,}")
+                if s in ("running", "retrying") and speed and rem_bytes:
+                    m[5].metric("Time left (approx.)", mm.fmt_duration(rem_bytes / speed),
+                                f"{speed / mm.MB:.2f} MB/s measured", delta_color="off")
                 else:
-                    st.error(f"{side}: {val}")
+                    m[5].metric("Speed (last 10 min)", f"{speed / mm.MB:.2f} MB/s" if speed else "–")
+                if total:
+                    st.progress(min(verified / total, 1.0),
+                                text=f"{verified:,} verified on the destination"
+                                     + (f", {unverified:,} uploaded and awaiting verification" if unverified else "")
+                                     + ". Totals grow while folders are scanned.")
 
-if start_clicked:
-    problems = validate(cfg, rows)
-    if problems:
-        for p in problems:
-            st.error(p)
-    else:
-        ss.job = start_job(rows, cfg)
-        st.rerun()
+            rows = []
+            for a in accounts:
+                st_ = stats.get(a["id"], {})
+                g = lambda k, i=0: st_.get(k, (0, 0))[i]  # noqa: E731
+                r = {"Account": a["source_user"], "Status": STATUS_ICON.get(a["status"], a["status"]),
+                     "Folder": a["current_folder"] or ""}
+                if dry:
+                    r.update({"To copy": g("pending"), "Size": mm.fmt_size(g("pending", 1)),
+                              "Attachments": a["attachments"]})
+                else:
+                    r.update({"Scanned": a["messages_scanned"], "Verified": g("verified"),
+                              "Size verified": mm.fmt_size(g("verified", 1)),
+                              "Remaining": g("pending") + g("retrying") + g("in_progress"),
+                              "Failed": g("failed"), "Review": g("needs_review"),
+                              "Reconnects": a["reconnect_count"]})
+                r.update({"Last activity": ago(a["last_activity_at"]), "Last error": a["last_error"] or ""})
+                rows.append(r)
+            table = pd.DataFrame(rows)
+            st.dataframe(table, hide_index=True, width="stretch")
 
-if stop_clicked and job:
-    job.stop.set()
-    st.toast("Stopping after the current message...")
+            probs = db.problem_messages(c, job_id, job["large_message_threshold_bytes"])
+            pdf = pd.DataFrame([{"id": p["id"], "Account": p["source_user"], "Folder": p["source_folder_name"],
+                                 "UID": p["source_uid"], "Size (MB)": round(p["source_rfc822_size"] / mm.MB, 1),
+                                 "Date": p["source_internal_date"], "Message-ID": p["source_message_id_header"],
+                                 "Status": p["status"], "Category": p["error_category"] or p["skip_reason"] or "",
+                                 "Error": p["last_error"] or ""} for p in probs])
+            if len(pdf):
+                with st.expander(f"⚠️ Problem and large emails ({len(pdf)})", expanded=not dry and bool(
+                        (pdf["Status"].isin(["failed", "needs_review"])).any())):
+                    st.caption("**needs_review**: an interrupted upload could not be proven present or absent, "
+                               "or a similar email already exists. It was NOT re-uploaded, to avoid a duplicate. "
+                               "Check the destination, then choose below.")
+                    st.dataframe(pdf.drop(columns=["id"]), hide_index=True, width="stretch")
+                    rv = pdf[pdf["Status"] == "needs_review"]
+                    if len(rv):
+                        x1, x2, x3 = st.columns([2, 1, 1])
+                        pick = x1.multiselect("Needs-review emails", rv["id"].tolist(), key=f"rv{job_id}",
+                                              format_func=lambda i: f"#{i} {rv.set_index('id').loc[i, 'Folder']} "
+                                                                    f"uid {rv.set_index('id').loc[i, 'UID']}")
+                        if x2.button("Accept as present", disabled=not pick, key=f"ra{job_id}"):
+                            db.resolve_review(c, job_id, pick, "accept")
+                            st.rerun()
+                        if x3.button("Copy anyway (may duplicate)", disabled=not pick, key=f"rc{job_id}"):
+                            db.resolve_review(c, job_id, pick, "copy")
+                            st.toast("Queued for copy. Click Sync again when the job has finished.")
 
+            with st.expander("Event log"):
+                ev = c.execute("SELECT created_at, level, category, details FROM job_events WHERE job_id=?"
+                               " ORDER BY id DESC LIMIT 200", (job_id,)).fetchall()
+                st.code("\n".join(f"{time.strftime('%m-%d %H:%M:%S', time.localtime(e['created_at']))} "
+                                  f"{e['level'].upper():7} {e['category']}: {e['details']}" for e in ev) or "–",
+                        language=None)
 
-# ------------------------------------------------------------------ progress
+            d1, d2, _ = st.columns([1, 1, 3])
+            d1.download_button("⬇ Account report", table.to_csv(index=False).encode(),
+                               f"mailmove_job{job_id}_accounts.csv", "text/csv", key=f"da{job_id}")
+            d2.download_button("⬇ Problem emails", pdf.drop(columns=["id"], errors="ignore").to_csv(index=False).encode(),
+                               f"mailmove_job{job_id}_problems.csv", "text/csv", key=f"dp{job_id}")
+            c.close()
 
-def render_progress():
-    job = ss.job
-    if job is None:
-        return
-    snap, big = job.snapshot()
-    total = sum(a["to_copy"] for a in snap.values())
-    copied = sum(a["copied"] for a in snap.values())
-    failed = sum(a["failed"] for a in snap.values())
-    total_bytes = sum(a["bytes_todo"] for a in snap.values())
-    done_bytes = sum(a["bytes_done"] for a in snap.values())
-    attachments = sum(a["attachments"] for a in snap.values())
-    done = sum(a["status"] not in ("queued", "running") for a in snap.values())
-    elapsed = (job.finished or time.time()) - job.started
+        job_view(ss.job_id)
 
-    st.divider()
-    head = "Dry run" if job.dry_run else "Migration"
-    if job.running:
-        st.subheader(f"{head} running... {'(stopping)' if job.stop.is_set() else ''}")
-    else:
-        st.subheader(f"{head} finished in {mm.fmt_duration(elapsed)}")
-
-    if job.dry_run:
-        m = st.columns(5)
-        m[0].metric("Accounts done", f"{done}/{len(snap)}")
-        m[1].metric("Emails to copy", f"{total:,}")
-        m[2].metric("Size to copy", mm.fmt_size(total_bytes))
-        m[3].metric("Attachments", f"{attachments:,}")
-        m[4].metric(f"Emails over {job.big_mb} MB", f"{len(big):,}")
-        if total:
-            fast, slow = mm.estimate_seconds(
-                [{"bytes": a["bytes_todo"], "count": a["to_copy"]} for a in snap.values()], job.workers)
-            note = "so far, " if job.running else ""
-            st.info(f"⏱ Estimated copy time ({note}{job.workers} mailbox(es) in parallel): "
-                    f"**{mm.fmt_duration(fast)} to {mm.fmt_duration(slow)}**. "
-                    "Rough guess; the real speed depends on both servers.")
-    else:
-        m = st.columns(5)
-        m[0].metric("Accounts done", f"{done}/{len(snap)}")
-        m[1].metric("Copied", f"{copied:,} / {total:,}")
-        m[2].metric("Size copied", f"{mm.fmt_size(done_bytes)} / {mm.fmt_size(total_bytes)}")
-        m[3].metric("Failed", f"{failed:,}")
-        speed = done_bytes / elapsed if elapsed > 0 else 0
-        if job.running and speed > 0 and elapsed > 20:
-            m[4].metric("Time left (est.)", mm.fmt_duration((total_bytes - done_bytes) / speed),
-                        f"{speed / mm.MB:.2f} MB/s", delta_color="off")
-        else:
-            m[4].metric("Speed", f"{speed / mm.MB:.2f} MB/s" if speed else "...")
-        if total_bytes:
-            st.progress(min(done_bytes / total_bytes, 1.0),
-                        text="Totals grow as each folder is scanned, so the bar can step back briefly.")
-
-    icons = {"queued": "⏳ queued", "running": "🔄 running", "ok": "✅ ok",
-             "partial": "⚠️ partial", "error": "❌ error", "stopped": "⏹ stopped"}
-    recs = []
-    for k, v in snap.items():
-        r = {"Account": k, "Status": icons.get(v["status"], v["status"]), "Current folder": v["folder"],
-             "Emails to copy": v["to_copy"], "Size": mm.fmt_size(v["bytes_todo"])}
-        if job.dry_run:
-            r["Attachments"] = v["attachments"]
-        else:
-            r["Copied"] = v["copied"]
-            r["Failed"] = v["failed"]
-        r["Large emails"] = v["big"]
-        r["Error"] = v["error"]
-        recs.append(r)
-    table = pd.DataFrame(recs)
-    st.dataframe(table, width="stretch", hide_index=True)
-
-    big_df = None
-    if big:
-        big_df = pd.DataFrame([
-            {"Account": b["account"], "Folder": b["folder"], "Size (MB)": round(b["size"] / mm.MB, 1),
-             "Date": b.get("date", ""), "From": b.get("from", ""), "Subject": b.get("subject", "")}
-            for b in sorted(big, key=lambda b: -b["size"])
-        ])
-        with st.expander(f"⚠️ {len(big)} email(s) over {job.big_mb} MB", expanded=not job.running):
-            st.caption("The new host may reject these if they exceed its max message size. "
-                       "Check its limit, or ask users to save those attachments elsewhere.")
-            st.dataframe(big_df, width="stretch", hide_index=True)
-
-    with st.expander("Live log", expanded=job.running):
-        st.code("\n".join(list(job.logs)[-200:]) or "Waiting...", language=None)
-
-    if not job.running:
-        csv_bytes = table.drop(columns=["Current folder"]).to_csv(index=False).encode()
-        d1, d2, d3, _ = st.columns([1, 1, 1, 2])
-        d1.download_button("⬇ Summary CSV", csv_bytes, "mailmove_summary.csv", "text/csv",
-                           width="stretch")
-        d2.download_button("⬇ Full log", "\n".join(job.logs).encode(), "mailmove_log.txt",
-                           width="stretch")
-        if big_df is not None:
-            d3.download_button("⬇ Large emails", big_df.to_csv(index=False).encode(),
-                               "mailmove_large_emails.csv", "text/csv", width="stretch")
-        if job.dry_run:
-            st.info("Dry run done. Turn off Dry run in Options and click Start migration to copy for real.")
-        else:
-            st.info("Done. After switching MX records, run the migration again to pick up late emails "
-                    "(only new messages will be copied). Then clear the passwords below.")
-
-
-@st.fragment(run_every=1.5)
-def live_progress():
-    render_progress()
-    if ss.job is not None and not ss.job.running and ss.get("_was_running"):
-        ss._was_running = False
-        st.rerun()  # re-enable the inputs once the job ends
-    if ss.job is not None and ss.job.running:
-        ss._was_running = True
-
-
-live_progress()
-
-st.divider()
-if st.button("🧹 Clear accounts and passwords", disabled=busy):
-    ss.accounts_df = pd.DataFrame([{c: "" for c in COLUMNS}])
-    ss.upload_id = f"cleared-{time.time()}"
-    ss.up_n += 1
-    st.rerun()
+    with st.expander("🧹 Purge stored passwords"):
+        st.caption("After the final sync is verified, remove every encrypted password from the database. "
+                   "Jobs and reports are kept, but they can no longer run.")
+        if st.button("Purge all stored passwords", type="secondary"):
+            n = db.purge_credentials(conn)
+            st.success(f"Purged credentials for {n} account row(s).")

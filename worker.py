@@ -629,6 +629,11 @@ class Worker:
         other = db.other_live_worker(self.conn, self.worker_id)
         if other and other["hostname"] == socket.gethostname() and not _pid_alive(other["pid"]):
             other = None  # crashed moments ago (systemd restart); its heartbeat is just not stale yet
+        with db.tx(self.conn):  # forget dead workers
+            self.conn.execute("DELETE FROM worker_heartbeat WHERE worker_id!=? AND last_heartbeat_at<?",
+                              (self.worker_id, db.now() - config.HEARTBEAT_STALE_SECONDS))
+            if other is None:
+                self.conn.execute("DELETE FROM worker_heartbeat WHERE worker_id!=?", (self.worker_id,))
         if other:
             raise SystemExit(f"Another worker (pid {other['pid']} on {other['hostname']}) is alive; refusing to start.")
         if not crypto.key_available():

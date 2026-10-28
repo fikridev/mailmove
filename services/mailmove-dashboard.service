@@ -1,0 +1,26 @@
+[Unit]
+Description=MailMove Streamlit dashboard (localhost only; use an SSH tunnel)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=mailmove
+Group=mailmove
+WorkingDirectory=/opt/mailmove
+EnvironmentFile=/etc/mailmove/mailmove.env
+ExecStart=/opt/mailmove/.venv/bin/streamlit run /opt/mailmove/app.py --server.address 127.0.0.1 --server.port 8501 --server.headless true --browser.gatherUsageStats false --server.fileWatcherType none
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+Environment=HOME=/var/lib/mailmove
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/mailmove
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

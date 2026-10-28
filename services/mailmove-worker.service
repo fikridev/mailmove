@@ -1,0 +1,29 @@
+[Unit]
+Description=MailMove migration worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=mailmove
+Group=mailmove
+WorkingDirectory=/opt/mailmove
+EnvironmentFile=/etc/mailmove/mailmove.env
+ExecStart=/opt/mailmove/.venv/bin/python /opt/mailmove/worker.py
+Restart=on-failure
+RestartSec=5
+# SIGTERM: finish the current message, requeue the job, exit.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+
+# Hardening (verified paths: only the data dir is writable)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/mailmove
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

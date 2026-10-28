@@ -182,3 +182,25 @@ def test_clone_dry_run_into_migration(env):
     real = db.clone_job(env.conn, dry, dry_run=False)
     assert env.run(real)["status"] == "completed"
     assert env.dst.count(U, "INBOX") == 2
+
+
+def test_graceful_shutdown_requeues_and_resumes(env):
+    """systemctl stop / restart (SIGTERM): finish the current message, requeue the job."""
+    seed(env, 5)
+    job = env.create_job()
+    w = env.worker()
+    calls = {"n": 0}
+
+    def stop_on_second(ctx):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            w.shutdown.set()
+        return False
+    env.dst.fault("append_before", match=stop_on_second, count=99)
+    w.startup()
+    w.run_once()
+    assert db.get_job(env.conn, job)["status"] == "queued"
+    assert env.messages(job, "in_progress") == []
+    assert env.run(job)["status"] == "completed"
+    assert env.dst.count(U, "INBOX") == 5
+    assert_no_duplicates(env)
