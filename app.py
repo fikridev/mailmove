@@ -85,7 +85,10 @@ with tab_new:
                             help="Start with 2 on an unstable host. Increase only if it stays healthy.")
         skip = o2.multiselect("Skip folders", ["trash", "junk", "drafts", "archive"], default=[],
                               help="Nothing is skipped by default.")
-        big_mb = o3.number_input("Large email warning (MB)", 1, 500, 25)
+        big_mb = o3.number_input("Label emails larger than (MB)", 1, 500, 25,
+                                 help="Label only. These emails are still copied automatically, with no approval "
+                                      "needed. They are listed so you can check them if the new host rejects one "
+                                      "as too large.")
 
     st.subheader("Accounts")
     up = st.file_uploader("Upload CSV (src_user, src_pass, dst_user, dst_pass). Read in memory only, never saved.",
