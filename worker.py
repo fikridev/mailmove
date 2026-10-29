@@ -521,7 +521,10 @@ class AccountRunner:
                                            f"({mm.fmt_size(config.MAX_MESSAGE_BYTES)}, MAILMOVE_MAX_MESSAGE_MB)")
             return
         self.set_account(current_folder=f"{sname} · downloading uid {uid} ({size})", last_activity_at=db.now())
+        t0 = time.time()
+        log.info("[job %s] %s %s uid %s (%s): downloading", self.job_id, self.user, sname, uid, size)
         got = self.src.fetch_message(uid)
+        t_dl = time.time() - t0
         if got is None:
             self.update_message(r["id"], status="skipped", skip_reason="deleted_on_source")
             self.event("warning", "deleted_on_source", f"uid {uid} disappeared before it was copied",
@@ -533,7 +536,10 @@ class AccountRunner:
         self.update_message(r["id"], status="in_progress", append_attempt_id=uuid.uuid4().hex,
                             attempts=r["attempts"] + 1, source_content_fingerprint=hashlib.sha256(raw).hexdigest())
         self.set_account(current_folder=f"{sname} · uploading uid {uid} ({size})", last_activity_at=db.now())
+        t1 = time.time()
         ok, duv, duid, text = self.dst.append(dname, flags, idate or r["source_internal_date"], raw)
+        log.info("[job %s] %s %s uid %s (%s): downloaded in %.1fs, uploaded in %.1fs -> %s", self.job_id,
+                 self.user, sname, uid, size, t_dl, time.time() - t1, "ok" if ok else self.clean(text))
         # (connection errors propagate from append: the message stays in_progress)
         if ok:
             self.update_message(r["id"], status="copied_unverified", copied_at=db.now(),

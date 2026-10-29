@@ -237,7 +237,8 @@ def classify(exc):
 def classify_text(text):
     t = (text or "").lower()
     if any(k in t for k in ("authenticationfailed", "authentication failed", "login failed",
-                            "invalid credentials", "authorizationfailed", "incorrect password")):
+                            "invalid credentials", "authorizationfailed", "incorrect password",
+                            "bad username", "username or password", "invalid login", "login incorrect")):
         return "auth", False
     if "overquota" in t or "quota" in t:
         return "quota", False

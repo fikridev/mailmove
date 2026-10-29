@@ -226,3 +226,8 @@ def test_classify():
     assert mm.classify_text("[OVERQUOTA] full") == ("quota", False)
     assert mm.classify_text("[TOOBIG] no") == ("too_large", False)
     assert mm.classify_text("[UNAVAILABLE] busy") == ("throttled", True)
+
+
+def test_cpanel_bad_password_wording_is_auth():
+    err = imaplib.IMAP4.error("b'LOGIN bad username or password'")
+    assert mm.classify(err) == ("auth", False)
