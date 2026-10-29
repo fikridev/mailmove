@@ -12,9 +12,9 @@ EnvironmentFile=/etc/mailmove/mailmove.env
 ExecStart=/opt/mailmove/.venv/bin/python /opt/mailmove/worker.py
 Restart=on-failure
 RestartSec=5
-# SIGTERM: finish the current message, requeue the job, exit.
+# SIGTERM: cut IMAP connections, requeue the job, exit (interrupted emails are re-checked on start).
 KillSignal=SIGTERM
-TimeoutStopSec=120
+TimeoutStopSec=30
 Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 
 # Hardening (verified paths: only the data dir is writable)

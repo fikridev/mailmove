@@ -204,3 +204,36 @@ def test_graceful_shutdown_requeues_and_resumes(env):
     assert env.run(job)["status"] == "completed"
     assert env.dst.count(U, "INBOX") == 5
     assert_no_duplicates(env)
+
+
+def test_shutdown_interrupts_a_slow_download_immediately(env):
+    """systemctl stop while an email is crawling in: the read is cut, nothing is lost or duplicated."""
+    import threading
+    import time
+    seed(env, 4)
+    job = env.create_job()
+    w = env.worker()
+    started = threading.Event()
+
+    def slow(ctx):
+        if ctx.get("uid") == 2:
+            started.set()
+            for _ in range(200):           # "download" that would take 20 s
+                if w.shutdown.is_set():
+                    raise OSError(9, "socket shut down")
+                time.sleep(0.1)
+        return False
+    env.src.fault("fetch_body", match=slow, count=99)
+    w.startup()
+    t = threading.Thread(target=w.run_once)
+    t.start()
+    assert started.wait(5)
+    t0 = time.time()
+    w.request_shutdown()
+    t.join(10)
+    assert time.time() - t0 < 3
+    assert db.get_job(env.conn, job)["status"] == "queued"
+    env.src.faults.clear()                 # the old host is fast again for the restarted worker
+    assert env.run(job)["status"] == "completed"
+    assert env.dst.count(U, "INBOX") == 4
+    assert_no_duplicates(env)

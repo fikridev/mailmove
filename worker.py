@@ -152,6 +152,18 @@ class AccountRunner:
                 m.close()
         self.src = self.dst = None
 
+    def abort_io(self):
+        """Interrupt a blocking read/write right away (used on shutdown). Safe: an email
+        mid-download is simply fetched again, one mid-upload stays in_progress and is
+        checked on the destination before any retry."""
+        for m in (self.src, self.dst):
+            sock = getattr(getattr(m, "conn", None), "sock", None)
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
     # -------------------------------------------------------------- main loop
 
     def run(self):
@@ -173,6 +185,9 @@ class AccountRunner:
                     self.fail(e.category, str(e))
                     return
                 except Exception as e:  # network / server errors
+                    if self.worker.shutdown.is_set():
+                        self.set_account(status="queued", current_folder=None)
+                        return
                     cat, retryable = ("throttled", True) if isinstance(e, TransientError) else mm.classify(e)
                     if cat == "auth":
                         auth_failures += 1
@@ -621,9 +636,15 @@ class Worker:
         self.mailbox_factory = mailbox_factory or mm.Mailbox
         self.worker_id = db.new_worker_id()
         self.shutdown = threading.Event()
+        self.runners = set()
         self.started_at = db.now()
         self.current_job = None
         self.conn = db.init_db(self.db_path)
+
+    def request_shutdown(self):
+        self.shutdown.set()
+        for r in list(self.runners):
+            r.abort_io()
 
     def beat(self):
         db.heartbeat(self.conn, self.worker_id, os.getpid(), socket.gethostname(), self.current_job, self.started_at)
@@ -694,7 +715,12 @@ class Worker:
 
     def _run_account(self, job, account_id):
         try:
-            AccountRunner(self, job, account_id).run()
+            runner = AccountRunner(self, job, account_id)
+            self.runners.add(runner)
+            try:
+                runner.run()
+            finally:
+                self.runners.discard(runner)
         except Exception as e:  # never let one account's bug take down the others
             log.exception("account %s crashed", account_id)
             conn = db.connect(self.db_path)
@@ -748,8 +774,8 @@ def main():
     w = Worker()
 
     def stop(signum, _frame):
-        log.info("signal %s: finishing current message, then stopping", signum)
-        w.shutdown.set()
+        log.info("signal %s: stopping now (interrupted emails are re-checked on restart)", signum)
+        w.request_shutdown()
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
