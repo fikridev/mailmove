@@ -287,12 +287,21 @@ with tab_jobs:
                 total = verified + unverified + remaining + failed + review
                 speed = db.recent_throughput(c, job_id)
                 m = st.columns(6)
-                m[0].metric("Verified", f"{verified:,} / {total:,}")
+                m[0].metric("Verified", f"{verified:,} / {total:,}",
+                            help="Confirmed present on the NEW server after upload (matched by its new UID, or by "
+                                 "Message-ID + size + date). Checked when each folder finishes copying, so it "
+                                 "stays at 0 while the first folder is still copying.")
                 m[1].metric("Size verified", mm.fmt_size(vbytes))
                 m[2].metric("Remaining", f"{remaining:,} ({mm.fmt_size(rem_bytes)})")
                 m[3].metric("Failed", f"{failed:,}")
                 m[4].metric("Needs review", f"{review:,}")
-                if s in ("running", "retrying") and speed and rem_bytes:
+                last_copy = db.last_copy_at(c, job_id)
+                quiet = time.time() - (last_copy or job["started_at"] or time.time())
+                if s in ("running", "retrying") and rem_bytes and quiet > 90:
+                    # nothing finished recently: an ETA from a stale speed would only keep growing
+                    m[5].metric("Time left (approx.)", "measuring…",
+                                f"last email finished {ago(last_copy) or 'not yet'}", delta_color="off")
+                elif s in ("running", "retrying") and speed and rem_bytes:
                     m[5].metric("Time left (approx.)", mm.fmt_duration(rem_bytes / speed),
                                 f"{speed / mm.MB:.2f} MB/s measured", delta_color="off")
                 else:
@@ -302,6 +311,14 @@ with tab_jobs:
                                 text=f"{verified:,} verified on the destination"
                                      + (f", {unverified:,} uploaded and awaiting verification" if unverified else "")
                                      + ". Totals grow while folders are scanned.")
+
+            if not dry and s in ("running", "retrying"):
+                busy = [f"**{a['source_user']}**: {a['current_folder']} (since {ago(a['last_activity_at'])})"
+                        for a in accounts if a["status"] in ("running", "retrying") and a["current_folder"]]
+                if busy:
+                    st.caption("Working on: " + " · ".join(busy) + ". A large email on a slow old server can "
+                               "take several minutes; the connection is fine unless Reconnects or Last error "
+                               "change.")
 
             rows = []
             for a in accounts:

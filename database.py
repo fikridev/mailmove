@@ -486,6 +486,12 @@ def recent_throughput(conn, job_id, window=600):
     return row["b"] / max(now() - row["first"], 30)
 
 
+def last_copy_at(conn, job_id):
+    return conn.execute(
+        "SELECT MAX(m.copied_at) FROM migration_messages m JOIN migration_folders f ON f.id=m.folder_id"
+        " JOIN migration_accounts a ON a.id=f.account_id WHERE a.job_id=?", (job_id,)).fetchone()[0]
+
+
 SAFE_ACCOUNT_COLUMNS = ("source_user", "destination_user", "status", "current_folder", "messages_scanned",
                         "messages_verified", "messages_failed", "bytes_verified", "retry_count",
                         "reconnect_count", "attachments", "last_error", "last_activity_at")

@@ -289,8 +289,9 @@ class AccountRunner:
         return {r["status"]: r["n"] for r in rows}
 
     def process_folder(self, fid, sname, dname):
-        self.set_account(current_folder=sname, last_activity_at=db.now())
+        self.set_account(current_folder=f"{sname} · scanning", last_activity_at=db.now())
         uv = self.scan_source(fid, sname)
+        self.refresh_counters()
         if self.dry_run:
             self.dry_run_folder(fid, sname, dname, uv)
             return
@@ -300,6 +301,7 @@ class AccountRunner:
             self.mark_folder_done(fid, uv)
             return
 
+        self.set_account(current_folder=f"{sname} · checking destination")
         self.dst.ensure_folder(dname)
         dest_uv, index = mm.load_dest_index(self.dst, dname)
         old_dest_uv = self.folder(fid)["destination_uidvalidity"]
@@ -317,6 +319,7 @@ class AccountRunner:
         self.src.examine(sname)  # re-select the source folder (read-only) before fetching bodies
         self.copy_pending(fid, sname, dname, uv)
 
+        self.set_account(current_folder=f"{sname} · verifying on destination")
         dest_uv, index = mm.load_dest_index(self.dst, dname)
         self.verify(fid, uv, dest_uv, index)
         with db.tx(self.conn):
@@ -500,7 +503,7 @@ class AccountRunner:
             for r in self.iter_messages(fid, uv, ("pending", "retrying"), page=200):
                 self.check_stop()
                 did = True
-                self.copy_one(fid, r, dname)
+                self.copy_one(fid, r, dname, sname)
             if not did:
                 break
         # anything still retrying after all rounds is a permanent failure
@@ -509,13 +512,15 @@ class AccountRunner:
                               " AND source_uidvalidity=? AND status='retrying' AND attempts>=?",
                               (db.now(), fid, uv, MAX_MESSAGE_ATTEMPTS))
 
-    def copy_one(self, fid, r, dname):
+    def copy_one(self, fid, r, dname, sname=""):
         uid = r["source_uid"]
+        size = mm.fmt_size(r["source_rfc822_size"])
         if r["source_rfc822_size"] > config.MAX_MESSAGE_BYTES:
             self.update_message(r["id"], status="failed", error_category="too_large",
                                 last_error=f"{mm.fmt_size(r['source_rfc822_size'])} exceeds the tool limit "
                                            f"({mm.fmt_size(config.MAX_MESSAGE_BYTES)}, MAILMOVE_MAX_MESSAGE_MB)")
             return
+        self.set_account(current_folder=f"{sname} · downloading uid {uid} ({size})", last_activity_at=db.now())
         got = self.src.fetch_message(uid)
         if got is None:
             self.update_message(r["id"], status="skipped", skip_reason="deleted_on_source")
@@ -527,6 +532,7 @@ class AccountRunner:
         # message stays in_progress and is reconciled before any retry
         self.update_message(r["id"], status="in_progress", append_attempt_id=uuid.uuid4().hex,
                             attempts=r["attempts"] + 1, source_content_fingerprint=hashlib.sha256(raw).hexdigest())
+        self.set_account(current_folder=f"{sname} · uploading uid {uid} ({size})", last_activity_at=db.now())
         ok, duv, duid, text = self.dst.append(dname, flags, idate or r["source_internal_date"], raw)
         # (connection errors propagate from append: the message stays in_progress)
         if ok:
