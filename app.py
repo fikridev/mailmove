@@ -204,6 +204,27 @@ with tab_jobs:
     if not jobs:
         st.info("No jobs yet.")
     else:
+        @st.fragment(run_every=5)
+        def jobs_overview():
+            c = db.connect()
+            rows = c.execute(
+                "SELECT j.id, j.status, j.dry_run, (SELECT GROUP_CONCAT(source_user, ', ') FROM migration_accounts"
+                " WHERE job_id=j.id) AS accounts,"
+                " (SELECT COUNT(*) FROM migration_messages m JOIN migration_folders f ON f.id=m.folder_id"
+                "  JOIN migration_accounts a ON a.id=f.account_id WHERE a.job_id=j.id) AS total,"
+                " (SELECT COUNT(*) FROM migration_messages m JOIN migration_folders f ON f.id=m.folder_id"
+                "  JOIN migration_accounts a ON a.id=f.account_id WHERE a.job_id=j.id"
+                "  AND m.status IN ('verified','copied_unverified')) AS copied"
+                " FROM migration_jobs j ORDER BY j.id DESC LIMIT 50").fetchall()
+            c.close()
+            st.markdown("**All jobs** (run one at a time, oldest queued first). Pick one below for details.")
+            st.dataframe(pd.DataFrame([{
+                "Job": f"#{r['id']}", "Type": "Dry run" if r["dry_run"] else "Migration",
+                "Status": STATUS_ICON.get(r["status"], r["status"]),
+                "Copied": "" if r["dry_run"] else f"{r['copied']:,} / {r['total']:,}",
+                "Accounts": r["accounts"] or ""} for r in rows]), hide_index=True, width="stretch")
+
+        jobs_overview()
         ids = [j["id"] for j in jobs]
         labels = {j["id"]: f"#{j['id']} {STATUS_ICON.get(j['status'], j['status'])} · {j['name']}" for j in jobs}
         default = ids.index(ss.job_id) if ss.job_id in ids else 0
