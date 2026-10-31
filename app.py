@@ -218,7 +218,20 @@ with tab_jobs:
                 "  JOIN migration_accounts a ON a.id=f.account_id WHERE a.job_id=j.id"
                 "  AND m.status IN ('verified','copied_unverified')) AS copied"
                 " FROM migration_jobs j ORDER BY j.id DESC LIMIT 50").fetchall()
+            now = c.execute(
+                "SELECT a.source_user, a.status, a.current_folder, a.last_activity_at, j.id AS job_id"
+                " FROM migration_accounts a JOIN migration_jobs j ON j.id=a.job_id"
+                " WHERE a.status IN ('running','retrying') AND j.status IN ('running','retrying','pausing')"
+                " ORDER BY j.id, a.position").fetchall()
+            waiting = c.execute("SELECT COUNT(*) FROM migration_jobs WHERE status='queued'").fetchone()[0]
             c.close()
+            if now:
+                for a in now:
+                    icon = "🔁 reconnecting to" if a["status"] == "retrying" else "🔄 Now copying"
+                    st.success(f"{icon} **{a['source_user']}** (job #{a['job_id']}) · "
+                               f"{a['current_folder'] or 'connecting'} · last activity {ago(a['last_activity_at'])}")
+            else:
+                st.info("Nothing is copying right now." + (f" {waiting} job(s) queued." if waiting else ""))
             st.markdown("**All jobs** (run one at a time, oldest queued first). Pick one below for details.")
             st.dataframe(pd.DataFrame([{
                 "Job": f"#{r['id']}", "Type": "Dry run" if r["dry_run"] else "Migration",
@@ -245,6 +258,8 @@ with tab_jobs:
             dry = bool(job["dry_run"])
             st.subheader(f"{'Dry run' if dry else 'Migration'} #{job_id}: {STATUS_ICON.get(job['status'], job['status'])}"
                          + (f" (pass {job['pass_number']})" if job["pass_number"] > 1 else ""))
+            st.markdown("**Accounts:** " + ", ".join(r["source_user"] for r in c.execute(
+                "SELECT source_user FROM migration_accounts WHERE job_id=? ORDER BY position", (job_id,))))
             st.caption(f"{job['source_host']} → {job['destination_host']} · {job['max_parallel_accounts']} in parallel · "
                        f"skip: {', '.join(json.loads(job['skip_folders_json'])) or 'nothing'} · "
                        f"worker heartbeat {ago(job['last_heartbeat_at'])}")
