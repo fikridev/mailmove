@@ -200,7 +200,9 @@ with tab_new:
 # ------------------------------------------------------------------ jobs
 
 with tab_jobs:
-    jobs = conn.execute("SELECT id, name, status, dry_run FROM migration_jobs ORDER BY id DESC LIMIT 50").fetchall()
+    jobs = conn.execute("SELECT j.id, j.status, j.dry_run, (SELECT GROUP_CONCAT(source_user, ', ') FROM"
+                        " migration_accounts WHERE job_id=j.id) AS accounts FROM migration_jobs j"
+                        " ORDER BY j.id DESC LIMIT 50").fetchall()
     if not jobs:
         st.info("No jobs yet.")
     else:
@@ -226,7 +228,13 @@ with tab_jobs:
 
         jobs_overview()
         ids = [j["id"] for j in jobs]
-        labels = {j["id"]: f"#{j['id']} {STATUS_ICON.get(j['status'], j['status'])} · {j['name']}" for j in jobs}
+        def label(j):
+            accts = j["accounts"] or ""
+            if len(accts) > 90:
+                accts = accts[:87] + "..."
+            kind = "Dry run" if j["dry_run"] else "Migration"
+            return f"#{j['id']} {STATUS_ICON.get(j['status'], j['status'])} · {kind} · {accts}"
+        labels = {j["id"]: label(j) for j in jobs}
         default = ids.index(ss.job_id) if ss.job_id in ids else 0
         ss.job_id = st.selectbox("Job", ids, index=default, format_func=lambda i: labels[i])
 
